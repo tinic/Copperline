@@ -19,8 +19,8 @@ or runtime library is linked (`-fno-exceptions -fno-rtti`).
 
 Rebuild with `make AMIGA_CXX=/path/to/m68k-amigaos-g++`. The committed
 binary was built with GCC 16.2.0b (20261010) and AmigaPorts binutils
-2.46.0.20260504. The tests read it,
-so neither runs need a cross-compiler:
+2.46.0.20260504. The tests read the committed binary, so neither
+command needs a cross-compiler:
 
 ```sh
 cargo test --no-default-features --features dap --lib debuginfo
