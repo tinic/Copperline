@@ -1613,11 +1613,13 @@ impl Session {
                         }
                         _ => None,
                     });
-                match member.and_then(|m| Some((m.offset?, m.ty))) {
-                    Some((offset, ty)) => {
-                        (addr.wrapping_add(offset), info.type_size(ty).unwrap_or(4))
-                    }
-                    None => return none("not a member at a fixed offset"),
+                match member {
+                    Some(crate::debuginfo::Member {
+                        offset: Some(offset),
+                        ty,
+                        ..
+                    }) => (addr.wrapping_add(offset), info.type_size(ty).unwrap_or(4)),
+                    _ => return none("not a member at a fixed offset"),
                 }
             }
             _ => match self.variable_place(name) {
@@ -2474,7 +2476,7 @@ impl eval::Env for EvalEnv<'_> {
             .info
             .as_ref()
             .ok_or_else(|| format!("unknown name {name}"))?;
-        if let Some(v) = info.variable_at(name, self.frame.pc) {
+        if let Some(v) = info.variable_lookup(name, self.frame.pc)? {
             let function = info.function_at(self.frame.pc);
             return match vars::place_of(info, &self.frame, function, &v.location)? {
                 vars::Place::Memory(addr) => {
