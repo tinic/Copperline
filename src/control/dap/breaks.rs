@@ -628,7 +628,7 @@ fn function_binding(found: &[NameMatch]) -> (&[NameMatch], Option<String>) {
     // resolves the name again.
     let mut message = match (ambiguous, left_out) {
         (false, 0) => return (bound, None),
-        (false, _) => format!("{MATCHES_PREFIX} {} functions", found.len()),
+        (false, _) => format!("{MATCHES_PREFIX} {} overloads", found.len()),
         (true, _) => {
             let names: Vec<&str> = bound.iter().map(|m| m.display.as_str()).collect();
             format!(
@@ -769,7 +769,7 @@ mod tests {
         assert_eq!(bound.len(), FUNCTION_MATCH_CAP);
         assert_eq!(
             message.as_deref(),
-            Some("matches 17 functions; 1 more not bound")
+            Some("matches 17 overloads; 1 more not bound")
         );
     }
 
