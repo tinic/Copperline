@@ -196,6 +196,21 @@ pointers (with the string behind a `char *`), arrays and structs expand in
 the Variables view. Without DWARF the Globals scope lists the data and BSS
 symbols as longs.
 
+### C++
+
+The same readers serve g++ output, such as AmigaPorts
+`m68k-amigaos-g++ -g -O0` (the `guest/dap-test/cpp` probe):
+
+| C++ construct | How the adapter shows it |
+|---|---|
+| Names | Functions, globals and types are qualified with their namespaces and classes, taken from the declaration an out-of-line definition completes: `geo::Scaler::scale`, `(anonymous namespace)::adjust`. Stack frames show the demangled linkage name, which tells overloads apart: `geo::Scaler::scale(int) const`. |
+| Hunk symbols | Mangled names (`__ZNK3geo6Scaler5scaleEi`) are demangled in stack frames, disassembly and the symbol-only Globals scope, and match function breakpoints, so a build without DWARF still names its functions. |
+| Function breakpoints | A qualified name binds every overload. A trailing part (`scale`, `Scaler::scale`) or a template name without arguments (`repeat`) binds every function it matches; when they are not overloads of one name the breakpoint message lists them (`matches 2 functions: geo::repeat<int, 2>(int), geo::repeat<short, 3>(short)`). A signature (`geo::Scaler::scale(int, int) const`) or a linkage name binds one overload. |
+| Base classes | One member per base class subobject, named after the base, at its offset; multiple inheritance shows each base. A virtual base's offset is a DWARF expression read through the vtable and shows as `<unsupported location>`. |
+| References | `T &` and `T &&` show the referenced object's value, and expand to its members. |
+| Pointers to members | `int geo::Point::*` shows the member it selects (`&geo::Point::y`); a member function pointer shows its function (`&geo::Scaler::scale(int) const`), a virtual one its vtable offset, and a non-zero `this` adjustment. |
+| Templates | Instances are named with their arguments (`geo::repeat<int, 2>`). A function instance's template parameters appear in its Locals as read-only constants (`T = int`, `N = 2`); a class template's parameters are not shown. |
+
 The console line printed at launch says what was found: `19 hunk symbols;
 DWARF from the executable's debug hunk: 3 function(s), 43 line row(s), 5
 global(s), call-frame info`.
@@ -231,6 +246,9 @@ second.
 
 ## Limitations
 
+- C++ exceptions, RTTI and virtual dispatch are not interpreted: a
+  polymorphic object shows its static type, with its vtable pointer as a
+  member.
 - Locals are shown for simple location expressions and one level of
   struct/array nesting; optimized code, location lists and DWARF
   expressions render as unsupported.
