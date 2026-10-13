@@ -49,12 +49,27 @@ pub struct Symbol {
     pub name: String,
     pub at: HunkAddr,
     pub size: Option<u32>,
+    /// [`demangle`] of `name`, worked out once: `None` for a C name.
+    pub demangled: Option<String>,
+    /// [`demangle_qualified`] of `name`, for name lookups.
+    pub qualified: Option<String>,
 }
 
 impl Symbol {
+    pub fn new(name: impl Into<String>, at: HunkAddr, size: Option<u32>) -> Self {
+        let name = name.into();
+        Self {
+            demangled: demangle(&name),
+            qualified: demangle_qualified(&name),
+            name,
+            at,
+            size,
+        }
+    }
+
     /// The name to show: demangled when it is a C++ symbol.
     pub fn display_name(&self) -> String {
-        demangle(&self.name).unwrap_or_else(|| self.name.clone())
+        self.demangled.clone().unwrap_or_else(|| self.name.clone())
     }
 }
 
@@ -436,11 +451,11 @@ impl DebugInfo {
         for (index, hunk) in file.hunks.iter().enumerate() {
             let hunk_index = index as u32;
             for sym in &hunk.symbols {
-                info.symbols.push(Symbol {
-                    name: sym.name.clone(),
-                    at: HunkAddr::new(hunk_index, sym.offset),
-                    size: sym.size,
-                });
+                info.symbols.push(Symbol::new(
+                    sym.name.clone(),
+                    HunkAddr::new(hunk_index, sym.offset),
+                    sym.size,
+                ));
                 symbol_count += 1;
             }
             for block in &hunk.lines {
@@ -871,10 +886,17 @@ impl DebugInfo {
         Some((same_addr, at.offset - same_addr.at.offset))
     }
 
-    /// A function or symbol by name (`main`, `_main`, `start`), as a
-    /// runtime address: the first of [`DebugInfo::lookup_all`].
+    /// The one function or symbol `name` names exactly (`main`,
+    /// `_main`, `start`, `geo::Scaler::scale(int) const`), as a runtime
+    /// address: rules 1 and 2 of [`DebugInfo::lookup_all`], without
+    /// trailing-part matches. `None` when nothing or more than one
+    /// function (overloads) matches, so the entry point and evaluated
+    /// names never pick one of several.
     pub fn lookup(&self, name: &str) -> Option<u32> {
-        self.lookup_all(name).first().map(|m| m.addr)
+        match self.matches(name, false).as_slice() {
+            [one] => Some(one.addr),
+            _ => None,
+        }
     }
 
     /// Every function or symbol `query` names, as runtime addresses.
@@ -888,10 +910,16 @@ impl DebugInfo {
     ///    `Scaler::scale`), with or without template arguments
     ///    (`repeat` for `geo::repeat<int, 2>`).
     ///
-    /// Then hunk symbols the same way, by raw or demangled name. The
-    /// matches are in address order; more than one distinct `name`
-    /// means the query is ambiguous.
+    /// The first rule that matches anything wins: an exact name never
+    /// also matches trailing parts of other names. Then hunk symbols the
+    /// same way, by raw or demangled name. The matches are in address
+    /// order; more than one distinct `name` means the query is
+    /// ambiguous.
     pub fn lookup_all(&self, query: &str) -> Vec<NameMatch> {
+        self.matches(query, true)
+    }
+
+    fn matches(&self, query: &str, trailing: bool) -> Vec<NameMatch> {
         let query = query.trim();
         let key = squash(query);
         let alt = match query.strip_prefix('_') {
@@ -921,7 +949,11 @@ impl DebugInfo {
             }
             _ => trailing_match(&f.name, &key),
         };
-        let rules: &[u8] = if query.contains('(') { &[1] } else { &[2, 3] };
+        let rules: &[u8] = match (query.contains('('), trailing) {
+            (true, _) => &[1],
+            (false, true) => &[2, 3],
+            (false, false) => &[2],
+        };
         for &rule in rules {
             for f in self.functions.iter().filter(|f| function_match(f, rule)) {
                 push(&mut found, f.name.clone(), f.display_name(), f.at);
@@ -932,17 +964,20 @@ impl DebugInfo {
             }
         }
         let symbol_match = |s: &Symbol, rule: u8| match rule {
-            1 => demangle(&s.name).is_some_and(|d| squash(&d) == key),
+            1 => s.demangled.as_deref().is_some_and(|d| squash(d) == key),
             2 => {
                 s.name == query
                     || s.name == alt
-                    || demangle_qualified(&s.name).is_some_and(|d| squash(&d) == key)
+                    || s.qualified.as_deref().is_some_and(|d| squash(d) == key)
             }
-            _ => demangle_qualified(&s.name).is_some_and(|d| trailing_match(&d, &key)),
+            _ => s
+                .qualified
+                .as_deref()
+                .is_some_and(|d| trailing_match(d, &key)),
         };
         for &rule in rules {
             for s in self.symbols.iter().filter(|s| symbol_match(s, rule)) {
-                let name = demangle_qualified(&s.name).unwrap_or_else(|| s.name.clone());
+                let name = s.qualified.clone().unwrap_or_else(|| s.name.clone());
                 push(&mut found, name, s.display_name(), s.at);
             }
             if !found.is_empty() {
@@ -954,10 +989,17 @@ impl DebugInfo {
     }
 
     /// The variable named `name` visible at `pc`: a local or parameter
-    /// of the enclosing function first, then a global.
+    /// of the enclosing function first, then a global. `None` also when
+    /// the name is ambiguous; [`DebugInfo::variable_lookup`] says so.
     pub fn variable_at(&self, name: &str, pc: u32) -> Option<&Variable> {
-        if let Some(f) = self.function_at(pc) {
-            let at = self.locate(pc)?;
+        self.variable_lookup(name, pc).ok().flatten()
+    }
+
+    /// [`DebugInfo::variable_at`] that tells an unknown name (`Ok(None)`)
+    /// from an unqualified name the globals of two namespaces share
+    /// (`Err`, listing them).
+    pub fn variable_lookup(&self, name: &str, pc: u32) -> Result<Option<&Variable>, String> {
+        if let (Some(f), Some(at)) = (self.function_at(pc), self.locate(pc)) {
             if let Some(v) = f
                 .locals
                 .iter()
@@ -972,15 +1014,31 @@ impl DebugInfo {
                     }
                 })
             {
-                return Some(v);
+                return Ok(Some(v));
             }
         }
-        // C++ globals carry their namespace; an unqualified name still
-        // finds one.
-        self.globals.iter().find(|v| v.name == name).or_else(|| {
-            let suffix = format!("::{name}");
-            self.globals.iter().find(|v| v.name.ends_with(&suffix))
-        })
+        if let Some(v) = self.globals.iter().find(|v| v.name == name) {
+            return Ok(Some(v));
+        }
+        // C++ globals carry their namespace; an unqualified name finds
+        // one when no other namespace has a global of that name.
+        let suffix = format!("::{name}");
+        let found: Vec<&Variable> = self
+            .globals
+            .iter()
+            .filter(|v| v.name.ends_with(&suffix))
+            .collect();
+        match found.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(one)),
+            many => Err(format!(
+                "{name} is ambiguous: {}",
+                many.iter()
+                    .map(|v| v.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
     }
 
     /// The file id whose recorded path best matches `path`: exact, then
@@ -1232,11 +1290,7 @@ mod tests {
         );
         assert_eq!(demangle("_entry"), None, "C names stay as they are");
         assert_eq!(demangle("__stext"), None);
-        let symbol = Symbol {
-            name: "__ZN4ItemC1Ev".into(),
-            at: HunkAddr::new(0, 0),
-            size: None,
-        };
+        let symbol = Symbol::new("__ZN4ItemC1Ev", HunkAddr::new(0, 0), None);
         assert_eq!(symbol.display_name(), "Item::Item()");
     }
 
@@ -1484,6 +1538,74 @@ mod fixture_tests {
         assert_eq!(info.lookup("entry"), info.lookup("_entry"));
         assert_eq!(info.lookup("entry"), Some(0x1_0000));
         assert!(info.lookup_all("geo::Point::x").is_empty());
+    }
+
+    #[test]
+    fn exact_lookup_needs_one_match_and_keeps_the_underscore_rule() {
+        let info = cpp();
+        // The entry point and evaluated names take exact names only.
+        let scale_1 = info.runtime(cpp_function(&info, "geo::Scaler::scale(int) const").at);
+        assert_eq!(info.lookup("geo::Scaler::scale(int) const"), scale_1);
+        assert_eq!(
+            info.lookup("_ZNK3geo6Scaler5scaleEi"),
+            scale_1,
+            "linkage name"
+        );
+        let adjust = info.runtime(cpp_function(&info, "(anonymous namespace)::adjust").at);
+        assert_eq!(info.lookup("(anonymous namespace)::adjust"), adjust);
+        assert_eq!(info.lookup("geo::Scaler::scale"), None, "two overloads");
+        assert_eq!(info.lookup("scale"), None, "no trailing-part match");
+        assert_eq!(info.lookup("adjust"), None, "no trailing-part match");
+        assert_eq!(info.lookup("repeat"), None);
+        // One leading underscore either way, for DWARF names and for
+        // hunk symbols alone.
+        assert_eq!(info.lookup("_entry"), Some(0x1_0000));
+        let program = include_bytes!("../../guest/dap-test/cpp/program");
+        let mut parsed = HunkFile::parse(program).unwrap();
+        parsed.dwarf = None;
+        let mut symbols_only = DebugInfo::from_hunk_file(&parsed);
+        symbols_only.relocate(vec![0x1_0000, 0x2_0000, 0x3_0000]);
+        assert_eq!(
+            symbols_only.lookup("entry"),
+            Some(0x1_0000),
+            "_entry symbol"
+        );
+        assert_eq!(symbols_only.lookup("_entry"), Some(0x1_0000));
+        assert_eq!(symbols_only.lookup("__ZNK3geo6Scaler5scaleEi"), scale_1);
+        assert_eq!(
+            symbols_only.lookup("geo::Scaler::scale(int) const"),
+            scale_1
+        );
+        assert_eq!(symbols_only.lookup("scale"), None);
+    }
+
+    #[test]
+    fn unqualified_globals_resolve_only_when_one_namespace_has_them() {
+        let mut info = cpp();
+        let origin = info
+            .globals
+            .iter()
+            .find(|g| g.name == "origin")
+            .unwrap()
+            .clone();
+        for name in ["a::count", "b::count", "geo::limit"] {
+            info.globals.push(Variable {
+                name: name.into(),
+                ..origin.clone()
+            });
+        }
+        let found = |name: &str| {
+            info.variable_lookup(name, 0)
+                .map(|v| v.map(|v| v.name.clone()))
+        };
+        assert_eq!(found("limit"), Ok(Some("geo::limit".into())));
+        assert_eq!(found("a::count"), Ok(Some("a::count".into())));
+        assert_eq!(
+            found("count"),
+            Err("count is ambiguous: a::count, b::count".into())
+        );
+        assert_eq!(found("missing"), Ok(None));
+        assert!(info.variable_at("count", 0).is_none());
     }
 
     #[test]
