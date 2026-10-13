@@ -594,11 +594,13 @@ mod tests {
     fn function(name: &str, offset: u32, size: u32, file: u32, line: u32) -> Function {
         Function {
             name: name.into(),
+            linkage_name: None,
             at: HunkAddr::new(0, offset),
             size,
             frame_base: Location::Unsupported,
             params: Vec::new(),
             locals: Vec::new(),
+            template_params: Vec::new(),
             file: Some(file),
             line: Some(line),
         }

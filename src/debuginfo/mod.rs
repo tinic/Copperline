@@ -51,6 +51,52 @@ pub struct Symbol {
     pub size: Option<u32>,
 }
 
+impl Symbol {
+    /// The name to show: demangled when it is a C++ symbol.
+    pub fn display_name(&self) -> String {
+        demangle(&self.name).unwrap_or_else(|| self.name.clone())
+    }
+}
+
+/// The Itanium demangling of a g++ linkage or symbol name, with the
+/// parameter list and without a template's return type
+/// (`geo::Scaler::scale(int) const`). Hunk symbols carry the amiga
+/// toolchains' extra leading underscore (`__ZN...`); ELF ones do not.
+pub fn demangle(name: &str) -> Option<String> {
+    demangle_with(
+        name,
+        cpp_demangle::DemangleOptions::new()
+            .no_return_type()
+            .hide_expression_literal_types(),
+    )
+}
+
+/// [`demangle`] without the parameter list: the qualified name a
+/// function breakpoint matches (`geo::repeat<int, 2>`).
+pub fn demangle_qualified(name: &str) -> Option<String> {
+    demangle_with(
+        name,
+        cpp_demangle::DemangleOptions::new()
+            .no_params()
+            .no_return_type()
+            .hide_expression_literal_types(),
+    )
+}
+
+fn demangle_with(name: &str, options: cpp_demangle::DemangleOptions) -> Option<String> {
+    let raw = name
+        .strip_prefix('_')
+        .filter(|rest| rest.starts_with("_Z"))
+        .unwrap_or(name);
+    if !raw.starts_with("_Z") {
+        return None;
+    }
+    cpp_demangle::Symbol::new(raw.as_bytes())
+        .ok()?
+        .demangle_with_options(&options)
+        .ok()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceFile {
     /// Normalised with `/` separators, as the producer recorded it.
@@ -102,19 +148,44 @@ pub struct Variable {
     pub scope: Option<(HunkAddr, u32)>,
 }
 
+/// A template parameter of a function instance: a type (`T = int`) or
+/// a value (`N = 2`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateParam {
+    pub name: String,
+    pub ty: Option<TypeId>,
+    /// The value of a value parameter, when it is an integer constant.
+    pub value: Option<i64>,
+    pub is_type: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
+    /// Qualified with its namespaces and classes (`geo::Scaler::scale`),
+    /// as the DWARF ancestry of its declaration gives them.
     pub name: String,
+    /// `DW_AT_linkage_name`: the mangled name, unique per overload.
+    pub linkage_name: Option<String>,
     pub at: HunkAddr,
     pub size: u32,
     pub frame_base: Location,
     pub params: Vec<Variable>,
     pub locals: Vec<Variable>,
+    pub template_params: Vec<TemplateParam>,
     pub file: Option<u32>,
     pub line: Option<u32>,
 }
 
 impl Function {
+    /// The name to show: the demangled linkage name, which tells
+    /// overloads apart (`geo::Scaler::scale(int) const`), else `name`.
+    pub fn display_name(&self) -> String {
+        self.linkage_name
+            .as_deref()
+            .and_then(demangle)
+            .unwrap_or_else(|| self.name.clone())
+    }
+
     /// Whether `at` (unrelocated) lies inside the function.
     pub fn contains(&self, at: HunkAddr) -> bool {
         at.hunk == self.at.hunk
@@ -156,9 +227,13 @@ pub enum Encoding {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
+    /// The member's name; a base class subobject is named after the
+    /// base class.
     pub name: String,
     pub ty: Option<TypeId>,
-    pub offset: u32,
+    /// Byte offset in the object; `None` when the location is an
+    /// expression (a virtual base, found through the vtable).
+    pub offset: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +246,20 @@ pub enum TypeDesc {
     Pointer {
         target: Option<TypeId>,
         size: u32,
+    },
+    /// A C++ reference: `T &`, or `T &&` when `rvalue`.
+    Reference {
+        target: Option<TypeId>,
+        size: u32,
+        rvalue: bool,
+    },
+    /// A C++ pointer to member, `T Class::*`: an offset for a data
+    /// member, a function pointer and `this` adjustment for a member
+    /// function. `size` is `DW_AT_byte_size` when given.
+    MemberPointer {
+        class: Option<TypeId>,
+        target: Option<TypeId>,
+        size: Option<u32>,
     },
     Array {
         element: Option<TypeId>,
@@ -276,6 +365,55 @@ const MAX_TYPE_DEPTH: usize = 32;
 
 pub fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+/// A function or symbol [`DebugInfo::lookup_all`] matched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameMatch {
+    /// The qualified name, shared by overloads.
+    pub name: String,
+    /// The name to show, with the parameter list for C++.
+    pub display: String,
+    pub addr: u32,
+}
+
+/// `name` without whitespace, so `repeat<int,2>` matches the
+/// producer's `repeat<int, 2>`.
+fn squash(name: &str) -> String {
+    name.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// `name` with every template argument list removed
+/// (`geo::Box<int>::get<2>` -> `geo::Box::get`). Operator names are
+/// left alone, since `<` there is not a bracket.
+fn strip_template_args(name: &str) -> String {
+    if name.contains("operator") {
+        return name.to_string();
+    }
+    let mut depth = 0usize;
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether squashed `key` names `qualified` by a trailing part of it
+/// (`scale`, `Scaler::scale`), with or without template arguments.
+fn trailing_match(qualified: &str, key: &str) -> bool {
+    let tail = |name: &str| {
+        let name = squash(name);
+        name == key || name.ends_with(&format!("::{key}"))
+    };
+    tail(qualified) || {
+        let bare = strip_template_args(qualified);
+        bare != qualified && tail(&bare)
+    }
 }
 
 impl DebugInfo {
@@ -400,6 +538,24 @@ impl DebugInfo {
                     target: remap_type(target),
                     size,
                 },
+                TypeDesc::Reference {
+                    target,
+                    size,
+                    rvalue,
+                } => TypeDesc::Reference {
+                    target: remap_type(target),
+                    size,
+                    rvalue,
+                },
+                TypeDesc::MemberPointer {
+                    class,
+                    target,
+                    size,
+                } => TypeDesc::MemberPointer {
+                    class: remap_type(class),
+                    target: remap_type(target),
+                    size,
+                },
                 TypeDesc::Array { element, count } => TypeDesc::Array {
                     element: remap_type(element),
                     count,
@@ -443,6 +599,14 @@ impl DebugInfo {
                 file: f.file.and_then(|i| file_map.get(i as usize).copied()),
                 params: f.params.into_iter().map(remap_var).collect(),
                 locals: f.locals.into_iter().map(remap_var).collect(),
+                template_params: f
+                    .template_params
+                    .into_iter()
+                    .map(|p| TemplateParam {
+                        ty: remap_type(p.ty),
+                        ..p
+                    })
+                    .collect(),
                 ..f
             });
         }
@@ -708,25 +872,85 @@ impl DebugInfo {
     }
 
     /// A function or symbol by name (`main`, `_main`, `start`), as a
-    /// runtime address.
+    /// runtime address: the first of [`DebugInfo::lookup_all`].
     pub fn lookup(&self, name: &str) -> Option<u32> {
-        let alt = match name.strip_prefix('_') {
+        self.lookup_all(name).first().map(|m| m.addr)
+    }
+
+    /// Every function or symbol `query` names, as runtime addresses.
+    ///
+    /// Functions first, by the first rule that matches any:
+    /// 1. with a parameter list, the demangled signature
+    ///    (`geo::Scaler::scale(int) const`): one overload;
+    /// 2. the qualified name (`geo::Scaler::scale`: every overload),
+    ///    the linkage name, or the C name with or without its `_`;
+    /// 3. a trailing part of the qualified name (`scale`,
+    ///    `Scaler::scale`), with or without template arguments
+    ///    (`repeat` for `geo::repeat<int, 2>`).
+    ///
+    /// Then hunk symbols the same way, by raw or demangled name. The
+    /// matches are in address order; more than one distinct `name`
+    /// means the query is ambiguous.
+    pub fn lookup_all(&self, query: &str) -> Vec<NameMatch> {
+        let query = query.trim();
+        let key = squash(query);
+        let alt = match query.strip_prefix('_') {
             Some(rest) => rest.to_string(),
-            None => format!("_{name}"),
+            None => format!("_{query}"),
         };
-        if let Some(f) = self
-            .functions
-            .iter()
-            .find(|f| f.name == name || f.name == alt)
-        {
-            return self.runtime(f.at);
+        let mut found: Vec<NameMatch> = Vec::new();
+        let push = |found: &mut Vec<NameMatch>, name: String, display: String, at: HunkAddr| {
+            if let Some(addr) = self.runtime(at) {
+                if !found.iter().any(|m| m.addr == addr) {
+                    found.push(NameMatch {
+                        name,
+                        display,
+                        addr,
+                    });
+                }
+            }
+        };
+        let function_match = |f: &Function, rule: u8| match rule {
+            1 => squash(&f.display_name()) == key,
+            2 => {
+                squash(&f.name) == key
+                    || f.name == alt
+                    || f.linkage_name
+                        .as_deref()
+                        .is_some_and(|l| l == query || l == alt)
+            }
+            _ => trailing_match(&f.name, &key),
+        };
+        let rules: &[u8] = if query.contains('(') { &[1] } else { &[2, 3] };
+        for &rule in rules {
+            for f in self.functions.iter().filter(|f| function_match(f, rule)) {
+                push(&mut found, f.name.clone(), f.display_name(), f.at);
+            }
+            if !found.is_empty() {
+                found.sort_by_key(|m| m.addr);
+                return found;
+            }
         }
-        let sym = self
-            .symbols
-            .iter()
-            .find(|s| s.name == name)
-            .or_else(|| self.symbols.iter().find(|s| s.name == alt))?;
-        self.runtime(sym.at)
+        let symbol_match = |s: &Symbol, rule: u8| match rule {
+            1 => demangle(&s.name).is_some_and(|d| squash(&d) == key),
+            2 => {
+                s.name == query
+                    || s.name == alt
+                    || demangle_qualified(&s.name).is_some_and(|d| squash(&d) == key)
+            }
+            _ => demangle_qualified(&s.name).is_some_and(|d| trailing_match(&d, &key)),
+        };
+        for &rule in rules {
+            for s in self.symbols.iter().filter(|s| symbol_match(s, rule)) {
+                let name = demangle_qualified(&s.name).unwrap_or_else(|| s.name.clone());
+                push(&mut found, name, s.display_name(), s.at);
+            }
+            if !found.is_empty() {
+                found.sort_by_key(|m| m.addr);
+                return found;
+            }
+        }
+        found
     }
 
     /// The variable named `name` visible at `pc`: a local or parameter
@@ -751,7 +975,12 @@ impl DebugInfo {
                 return Some(v);
             }
         }
-        self.globals.iter().find(|v| v.name == name)
+        // C++ globals carry their namespace; an unqualified name still
+        // finds one.
+        self.globals.iter().find(|v| v.name == name).or_else(|| {
+            let suffix = format!("::{name}");
+            self.globals.iter().find(|v| v.name.ends_with(&suffix))
+        })
     }
 
     /// The file id whose recorded path best matches `path`: exact, then
@@ -826,13 +1055,26 @@ impl DebugInfo {
         match self.types.get(self.resolve_type(ty)?)? {
             TypeDesc::Base { size, .. }
             | TypeDesc::Pointer { size, .. }
+            | TypeDesc::Reference { size, .. }
             | TypeDesc::Struct { size, .. }
             | TypeDesc::Enum { size, .. } => Some(*size),
+            TypeDesc::MemberPointer { size, target, .. } => {
+                Some(size.unwrap_or(if self.is_function_type(*target) { 8 } else { 4 }))
+            }
             TypeDesc::Array { element, count } => self
                 .type_size_depth(*element, depth + 1)?
                 .checked_mul(u32::try_from((*count)?).ok()?),
             _ => None,
         }
+    }
+
+    /// Whether `ty` is a function type: a member pointer to one is a
+    /// member function pointer.
+    pub fn is_function_type(&self, ty: Option<TypeId>) -> bool {
+        matches!(
+            self.resolve_type(ty).and_then(|t| self.types.get(t)),
+            Some(TypeDesc::Function)
+        )
     }
 
     pub fn type_name(&self, ty: Option<TypeId>) -> String {
@@ -850,6 +1092,18 @@ impl DebugInfo {
         match self.types.get(id) {
             Some(TypeDesc::Base { name, .. }) => name.clone(),
             Some(TypeDesc::Pointer { target, .. }) => format!("{} *", inner(*target)),
+            Some(TypeDesc::Reference { target, rvalue, .. }) => {
+                format!("{} {}", inner(*target), if *rvalue { "&&" } else { "&" })
+            }
+            Some(TypeDesc::MemberPointer { class, target, .. }) => {
+                let class = match class.and_then(|c| self.types.get(c)) {
+                    Some(TypeDesc::Struct {
+                        name: Some(name), ..
+                    }) => name.clone(),
+                    _ => inner(*class),
+                };
+                format!("{} {class}::*", inner(*target))
+            }
             Some(TypeDesc::Array { element, count }) => match count {
                 Some(n) => format!("{}[{n}]", inner(*element)),
                 None => format!("{}[]", inner(*element)),
@@ -863,8 +1117,15 @@ impl DebugInfo {
                 format!("enum {}", name.as_deref().unwrap_or("<anonymous>"))
             }
             Some(TypeDesc::Typedef { name, .. }) => name.clone(),
+            // A qualified pointer reads `T * const`, the pointee's
+            // qualifier `const T *`.
             Some(TypeDesc::Qualified { qualifier, target }) => {
-                format!("{qualifier} {}", inner(*target))
+                match target.and_then(|t| self.types.get(t)) {
+                    Some(TypeDesc::Pointer { .. } | TypeDesc::MemberPointer { .. }) => {
+                        format!("{} {qualifier}", inner(*target))
+                    }
+                    _ => format!("{qualifier} {}", inner(*target)),
+                }
             }
             Some(TypeDesc::Function) => "function".to_string(),
             Some(TypeDesc::Void) => "void".to_string(),
@@ -954,6 +1215,43 @@ mod tests {
         assert!(!info.relocated());
         assert_eq!(info.lookup("start"), None);
         assert_eq!(info.line_for(0), None);
+    }
+
+    #[test]
+    fn itanium_names_demangle_with_and_without_the_hunk_underscore() {
+        let hunk = "__ZNK3geo6Scaler5scaleEi";
+        assert_eq!(
+            demangle(hunk).as_deref(),
+            Some("geo::Scaler::scale(int) const")
+        );
+        assert_eq!(demangle(&hunk[1..]), demangle(hunk), "ELF spelling");
+        assert_eq!(
+            demangle_qualified("__ZN3geo6repeatIiLi2EEET_S1_").as_deref(),
+            Some("geo::repeat<int, 2>"),
+            "no parameters, no template return type"
+        );
+        assert_eq!(demangle("_entry"), None, "C names stay as they are");
+        assert_eq!(demangle("__stext"), None);
+        let symbol = Symbol {
+            name: "__ZN4ItemC1Ev".into(),
+            at: HunkAddr::new(0, 0),
+            size: None,
+        };
+        assert_eq!(symbol.display_name(), "Item::Item()");
+    }
+
+    #[test]
+    fn function_names_match_by_trailing_scope_and_template() {
+        assert!(trailing_match("geo::Scaler::scale", "scale"));
+        assert!(trailing_match("geo::Scaler::scale", "Scaler::scale"));
+        assert!(!trailing_match("geo::Scaler::scale", "caler::scale"));
+        assert!(trailing_match("geo::repeat<int, 2>", "repeat"));
+        assert!(trailing_match(
+            "geo::repeat<int, 2>",
+            &squash("repeat<int,2>")
+        ));
+        assert_eq!(strip_template_args("a::B<c::D<int>>::f<1>"), "a::B::f");
+        assert_eq!(strip_template_args("a::operator<"), "a::operator<");
     }
 
     #[test]
@@ -1083,6 +1381,218 @@ mod fixture_tests {
             for pc in addresses {
                 assert_eq!(info.function_at(pc).unwrap().name, "worker");
             }
+        }
+    }
+
+    fn cpp() -> DebugInfo {
+        let mut info = DebugInfo::load(include_bytes!("../../guest/dap-test/cpp/program"), None)
+            .expect("cpp parses");
+        info.relocate(vec![0x1_0000, 0x2_0000, 0x3_0000]);
+        info
+    }
+
+    fn cpp_function<'a>(info: &'a DebugInfo, display: &str) -> &'a Function {
+        info.functions
+            .iter()
+            .find(|f| f.display_name() == display)
+            .unwrap_or_else(|| panic!("{display}: {:?}", info.functions))
+    }
+
+    #[test]
+    fn cpp_functions_have_qualified_names_and_linkage_names() {
+        let info = cpp();
+        let names: Vec<(&str, Option<&str>)> = info
+            .functions
+            .iter()
+            .map(|f| (f.name.as_str(), f.linkage_name.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("entry", None),
+                ("geo::Scaler::scale", Some("_ZNK3geo6Scaler5scaleEi")),
+                ("geo::Scaler::scale", Some("_ZNK3geo6Scaler5scaleEii")),
+                ("(anonymous namespace)::adjust", None),
+                ("inspect", None),
+                ("Item::Item", Some("_ZN4ItemC1Ev")),
+                ("geo::repeat<int, 2>", Some("_ZN3geo6repeatIiLi2EEET_S1_")),
+                (
+                    "geo::repeat<short int, 3>",
+                    Some("_ZN3geo6repeatIsLi3EEET_S1_")
+                ),
+            ],
+            "{:?}",
+            info.notes
+        );
+        for f in &info.functions {
+            let Some(linkage) = &f.linkage_name else {
+                continue;
+            };
+            let symbol = info
+                .symbols
+                .iter()
+                .find(|s| s.name.strip_prefix('_') == Some(linkage))
+                .unwrap_or_else(|| panic!("hunk symbol for {linkage}"));
+            assert_eq!(symbol.at, f.at, "{}", f.name);
+            assert_eq!(symbol.display_name(), f.display_name());
+        }
+        let constructor = cpp_function(&info, "Item::Item()");
+        assert_eq!(
+            info.type_name(constructor.params[0].ty),
+            "struct Item * const"
+        );
+        let scale = cpp_function(&info, "geo::Scaler::scale(int, int) const");
+        assert_eq!(
+            info.type_name(scale.params[0].ty),
+            "const struct geo::Scaler * const",
+            "this"
+        );
+        assert_eq!(scale.params[2].name, "extra");
+    }
+
+    #[test]
+    fn cpp_function_names_resolve_overloads_scopes_and_templates() {
+        let info = cpp();
+        let addr = |display: &str| info.runtime(cpp_function(&info, display).at).unwrap();
+        let addrs =
+            |query: &str| -> Vec<u32> { info.lookup_all(query).iter().map(|m| m.addr).collect() };
+        let scale_1 = addr("geo::Scaler::scale(int) const");
+        let scale_2 = addr("geo::Scaler::scale(int, int) const");
+        let repeat_int = addr("geo::repeat<int, 2>(int)");
+        let repeat_short = addr("geo::repeat<short, 3>(short)");
+        // Every overload of a qualified or unique unqualified name.
+        for query in ["geo::Scaler::scale", "Scaler::scale", "scale"] {
+            assert_eq!(addrs(query), vec![scale_1, scale_2], "{query}");
+        }
+        // One overload by its signature or linkage name.
+        assert_eq!(addrs("geo::Scaler::scale(int,int) const"), vec![scale_2]);
+        assert_eq!(addrs("_ZNK3geo6Scaler5scaleEi"), vec![scale_1]);
+        // Two template instances: the bare name matches both and is
+        // ambiguous (two distinct names); arguments pick one.
+        let both = info.lookup_all("repeat");
+        assert_eq!(
+            both.iter().map(|m| m.addr).collect::<Vec<_>>(),
+            vec![repeat_int, repeat_short]
+        );
+        assert_ne!(both[0].name, both[1].name);
+        assert_eq!(addrs("geo::repeat<int,2>"), vec![repeat_int]);
+        // The anonymous namespace qualifies, and the bare name is unique.
+        let adjust = addr("(anonymous namespace)::adjust");
+        assert_eq!(addrs("adjust"), vec![adjust]);
+        assert_eq!(addrs("(anonymous namespace)::adjust"), vec![adjust]);
+        // C linkage keeps the C rules.
+        assert_eq!(info.lookup("entry"), info.lookup("_entry"));
+        assert_eq!(info.lookup("entry"), Some(0x1_0000));
+        assert!(info.lookup_all("geo::Point::x").is_empty());
+    }
+
+    #[test]
+    fn mangled_hunk_symbols_resolve_without_dwarf() {
+        let program = include_bytes!("../../guest/dap-test/cpp/program");
+        let mut parsed = HunkFile::parse(program).unwrap();
+        parsed.dwarf = None;
+        let mut info = DebugInfo::from_hunk_file(&parsed);
+        assert!(info.functions.is_empty());
+        info.relocate(vec![0x1_0000, 0x2_0000, 0x3_0000]);
+        let found = info.lookup_all("scale");
+        let shown: Vec<&str> = found.iter().map(|m| m.display.as_str()).collect();
+        assert_eq!(
+            shown,
+            vec![
+                "geo::Scaler::scale(int) const",
+                "geo::Scaler::scale(int, int) const"
+            ]
+        );
+        assert_eq!(found[0].name, found[1].name, "overloads, not ambiguous");
+        let (symbol, offset) = info.symbol_at(found[1].addr + 2).unwrap();
+        assert_eq!((symbol.display_name().as_str(), offset), (shown[1], 2));
+        assert_eq!(info.lookup_all("geo::repeat<short,3>(short)").len(), 1);
+    }
+
+    #[test]
+    fn cpp_types_cover_bases_references_member_pointers_and_templates() {
+        let info = cpp();
+        let item_type = info
+            .types
+            .iter()
+            .find(|t| matches!(t, TypeDesc::Struct { name: Some(n), .. } if n == "Item"))
+            .unwrap();
+        let TypeDesc::Struct { members, .. } = item_type else {
+            unreachable!()
+        };
+        let layout: Vec<(&str, Option<u32>)> = members
+            .iter()
+            .filter(|m| !m.name.starts_with("_vptr"))
+            .map(|m| (m.name.as_str(), m.offset))
+            .collect();
+        assert_eq!(
+            layout,
+            vec![
+                ("Named", Some(4)),
+                ("Counted", Some(8)),
+                ("Shared", None),
+                ("weight", Some(12)),
+            ],
+            "bases after the vtable pointer; the virtual base has no fixed offset"
+        );
+        let named = members.iter().find(|m| m.name == "Named").unwrap();
+        assert_eq!(info.type_name(named.ty), "struct Named");
+
+        let adjust = cpp_function(&info, "(anonymous namespace)::adjust");
+        let types: Vec<String> = adjust.params.iter().map(|p| info.type_name(p.ty)).collect();
+        assert_eq!(types, vec!["int &", "int &&"]);
+        assert!(matches!(
+            info.resolve_type(adjust.params[1].ty)
+                .map(|t| &info.types[t]),
+            Some(TypeDesc::Reference {
+                rvalue: true,
+                size: 4,
+                ..
+            })
+        ));
+        let inspect = cpp_function(&info, "inspect");
+        assert_eq!(info.type_name(inspect.params[0].ty), "struct Item &");
+
+        let global = |name: &str| info.globals.iter().find(|g| g.name == name).unwrap();
+        assert_eq!(info.type_name(global("axis").ty), "int geo::Point::*");
+        assert_eq!(info.type_size(global("axis").ty), Some(4));
+        assert_eq!(
+            info.type_name(global("method").ty),
+            "function geo::Scaler::*"
+        );
+        assert_eq!(
+            info.type_size(global("method").ty),
+            Some(8),
+            "pointer + adjustment"
+        );
+        assert_eq!(info.type_name(global("origin").ty), "struct geo::Point");
+        assert_eq!(
+            info.variable_at("origin", 0).map(|v| &v.name),
+            Some(&global("origin").name)
+        );
+
+        for (display, expected) in [
+            (
+                "geo::repeat<int, 2>(int)",
+                [("T", "int", None), ("N", "int", Some(2))],
+            ),
+            (
+                "geo::repeat<short, 3>(short)",
+                [("T", "short int", None), ("N", "int", Some(3))],
+            ),
+        ] {
+            let f = cpp_function(&info, display);
+            let params: Vec<(&str, String, Option<i64>)> = f
+                .template_params
+                .iter()
+                .map(|p| (p.name.as_str(), info.type_name(p.ty), p.value))
+                .collect();
+            let expected: Vec<(&str, String, Option<i64>)> = expected
+                .iter()
+                .map(|(n, t, v)| (*n, t.to_string(), *v))
+                .collect();
+            assert_eq!(params, expected, "{display}");
+            assert!(f.template_params[0].is_type);
         }
     }
 
@@ -1246,7 +1756,7 @@ mod fixture_tests {
                 assert_eq!(*size, 8);
                 let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
                 assert_eq!(names, vec!["x", "y"]);
-                assert_eq!(members[1].offset, 4);
+                assert_eq!(members[1].offset, Some(4));
             }
             other => panic!("origin is {other:?}"),
         }
