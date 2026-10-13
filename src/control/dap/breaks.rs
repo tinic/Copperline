@@ -623,17 +623,23 @@ const FUNCTION_MATCH_CAP: usize = 16;
 fn function_binding(found: &[NameMatch]) -> (&[NameMatch], Option<String>) {
     let bound = &found[..found.len().min(FUNCTION_MATCH_CAP)];
     let ambiguous = found.iter().any(|m| m.name != found[0].name);
-    if !ambiguous && bound.len() == found.len() {
-        return (bound, None);
-    }
-    let names: Vec<&str> = bound.iter().map(|m| m.display.as_str()).collect();
-    let mut message = format!(
-        "{MATCHES_PREFIX} {} functions: {}",
-        found.len(),
-        names.join(", ")
-    );
-    if bound.len() < found.len() {
-        message.push_str(&format!("; {} more not bound", found.len() - bound.len()));
+    let left_out = found.len() - bound.len();
+    // The message starts with MATCHES_PREFIX either way, so a rebind
+    // resolves the name again.
+    let mut message = match (ambiguous, left_out) {
+        (false, 0) => return (bound, None),
+        (false, _) => format!("{MATCHES_PREFIX} {} functions", found.len()),
+        (true, _) => {
+            let names: Vec<&str> = bound.iter().map(|m| m.display.as_str()).collect();
+            format!(
+                "{MATCHES_PREFIX} {} functions: {}",
+                found.len(),
+                names.join(", ")
+            )
+        }
+    };
+    if left_out > 0 {
+        message.push_str(&format!("; {left_out} more not bound"));
     }
     (bound, Some(message))
 }
@@ -746,22 +752,25 @@ mod tests {
         let (bound, message) = function_binding(&many);
         assert_eq!(bound.len(), FUNCTION_MATCH_CAP);
         assert_eq!(bound, &many[..FUNCTION_MATCH_CAP]);
-        let message = message.unwrap();
-        assert!(
-            message.starts_with("matches 21 functions: c0::get(), "),
-            "{message}"
+        let listed: Vec<String> = (0..FUNCTION_MATCH_CAP)
+            .map(|i| format!("c{i}::get()"))
+            .collect();
+        assert_eq!(
+            message.unwrap(),
+            format!(
+                "matches 21 functions: {}; 5 more not bound",
+                listed.join(", ")
+            )
         );
-        assert!(
-            message.ends_with("c15::get(); 5 more not bound"),
-            "{message}"
-        );
-        assert!(!message.contains("c16::get"), "{message}");
 
-        // Overloads past the cap also say how many were left out.
+        // Overloads past the cap only say how many were left out.
         let same = matches(&["f"; FUNCTION_MATCH_CAP + 1]);
         let (bound, message) = function_binding(&same);
         assert_eq!(bound.len(), FUNCTION_MATCH_CAP);
-        assert!(message.unwrap().ends_with("; 1 more not bound"));
+        assert_eq!(
+            message.as_deref(),
+            Some("matches 17 functions; 1 more not bound")
+        );
     }
 
     #[test]

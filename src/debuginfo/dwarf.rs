@@ -778,6 +778,7 @@ impl<'d, 'a> Ctx<'d, 'a> {
                     .qualified_name(unit, entry)
                     .unwrap_or_else(|| format!("fn_{:x}", entry.offset().0));
                 let linkage_name = self.linkage_name(unit, entry);
+                let demangled = linkage_name.as_deref().and_then(super::demangle);
                 let frame_base = self.location(unit, entry, gimli::DW_AT_frame_base, &name);
                 let file = Self::udata(entry, gimli::DW_AT_decl_file);
                 let line = Self::udata(entry, gimli::DW_AT_decl_line);
@@ -785,6 +786,7 @@ impl<'d, 'a> Ctx<'d, 'a> {
                 self.out.functions.push(Function {
                     name,
                     linkage_name,
+                    demangled,
                     at,
                     size,
                     frame_base,

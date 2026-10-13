@@ -181,6 +181,8 @@ pub struct Function {
     pub name: String,
     /// `DW_AT_linkage_name`: the mangled name, unique per overload.
     pub linkage_name: Option<String>,
+    /// [`demangle`] of `linkage_name`, worked out once at load.
+    pub demangled: Option<String>,
     pub at: HunkAddr,
     pub size: u32,
     pub frame_base: Location,
@@ -194,11 +196,8 @@ pub struct Function {
 impl Function {
     /// The name to show: the demangled linkage name, which tells
     /// overloads apart (`geo::Scaler::scale(int) const`), else `name`.
-    pub fn display_name(&self) -> String {
-        self.linkage_name
-            .as_deref()
-            .and_then(demangle)
-            .unwrap_or_else(|| self.name.clone())
+    pub fn display_name(&self) -> &str {
+        self.demangled.as_deref().unwrap_or(&self.name)
     }
 
     /// Whether `at` (unrelocated) lies inside the function.
@@ -939,7 +938,7 @@ impl DebugInfo {
             }
         };
         let function_match = |f: &Function, rule: u8| match rule {
-            1 => squash(&f.display_name()) == key,
+            1 => squash(f.display_name()) == key,
             2 => {
                 squash(&f.name) == key
                     || f.name == alt
@@ -956,7 +955,12 @@ impl DebugInfo {
         };
         for &rule in rules {
             for f in self.functions.iter().filter(|f| function_match(f, rule)) {
-                push(&mut found, f.name.clone(), f.display_name(), f.at);
+                push(
+                    &mut found,
+                    f.name.clone(),
+                    f.display_name().to_string(),
+                    f.at,
+                );
             }
             if !found.is_empty() {
                 found.sort_by_key(|m| m.addr);

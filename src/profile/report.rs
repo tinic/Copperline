@@ -752,6 +752,7 @@ mod tests {
         debug.functions = vec![Function {
             name: "parent".into(),
             linkage_name: None,
+            demangled: None,
             at: HunkAddr::new(0, 0),
             size: 0x100,
             frame_base: crate::debuginfo::Location::Unsupported,
@@ -862,6 +863,7 @@ mod tests {
         debug.functions = vec![Function {
             name: "patched_entry".into(),
             linkage_name: None,
+            demangled: None,
             at: HunkAddr::new(0, 0),
             size: 0x100,
             frame_base: crate::debuginfo::Location::Unsupported,

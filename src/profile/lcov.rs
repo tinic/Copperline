@@ -595,6 +595,7 @@ mod tests {
         Function {
             name: name.into(),
             linkage_name: None,
+            demangled: None,
             at: HunkAddr::new(0, offset),
             size,
             frame_base: Location::Unsupported,
