@@ -417,6 +417,25 @@ pub fn render(
                 });
             }
         }
+        TypeDesc::Reference { target, .. } => {
+            // Shown as the object it refers to, like a debugger shows a
+            // C++ reference: the value and children of the referent.
+            let Some(ptr) = mem.read32(addr) else {
+                rendered.value = "<unreadable>".into();
+                return rendered;
+            };
+            if ptr == 0 {
+                rendered.value = "<null reference>".into();
+                return rendered;
+            }
+            let referent = render(info, mem, *target, ptr, frame);
+            rendered.value = referent.value;
+            rendered.children = referent.children;
+            rendered.memory = Some(ptr);
+        }
+        TypeDesc::MemberPointer { class, target, .. } => {
+            rendered.value = render_member_pointer(info, mem, addr, *class, *target);
+        }
         TypeDesc::Array { element, count } => {
             rendered.value = match count {
                 Some(n) => format!("[{n}] {}", info.type_name(*element)),
@@ -441,7 +460,7 @@ pub fn render(
         TypeDesc::Struct { members, .. } => {
             let mut parts = Vec::new();
             for m in members.iter().take(4) {
-                let inner = render(info, mem, m.ty, addr.wrapping_add(m.offset), frame);
+                let inner = render_member(info, mem, m, addr, frame);
                 parts.push(format!("{}: {}", m.name, inner.value));
             }
             if members.len() > 4 {
@@ -470,6 +489,80 @@ pub fn render(
         TypeDesc::Typedef { .. } | TypeDesc::Qualified { .. } => unreachable!("resolved"),
     }
     rendered
+}
+
+/// A struct member (or base class subobject) of the object at `addr`.
+fn render_member(
+    info: &DebugInfo,
+    mem: &mut GuestMem,
+    member: &crate::debuginfo::Member,
+    addr: u32,
+    frame: usize,
+) -> Rendered {
+    match member.offset {
+        Some(offset) => render(info, mem, member.ty, addr.wrapping_add(offset), frame),
+        None => Rendered {
+            value: "<unsupported location>".into(),
+            ty: info.type_name(member.ty),
+            children: None,
+            memory: None,
+        },
+    }
+}
+
+/// A C++ pointer to member under the Itanium ABI: a data member's is
+/// its byte offset (-1 is null); a member function's is the function
+/// address, or 1 + the vtable offset for a virtual one, followed by the
+/// `this` adjustment.
+fn render_member_pointer(
+    info: &DebugInfo,
+    mem: &mut GuestMem,
+    addr: u32,
+    class: Option<TypeId>,
+    target: Option<TypeId>,
+) -> String {
+    let class_desc = info.resolve_type(class).and_then(|t| info.types.get(t));
+    let class_name = match class_desc {
+        Some(TypeDesc::Struct {
+            name: Some(name), ..
+        }) => name.clone(),
+        _ => info.type_name(class),
+    };
+    if info.is_function_type(target) {
+        let (Some(ptr), Some(adj)) = (mem.read32(addr), mem.read32(addr.wrapping_add(4))) else {
+            return "<unreadable>".into();
+        };
+        let mut value = if ptr == 0 {
+            "NULL".to_string()
+        } else if ptr & 1 != 0 {
+            format!("virtual, vtable offset {}", ptr - 1)
+        } else {
+            match info.function_at(ptr) {
+                Some(f) if info.runtime(f.at) == Some(ptr) => format!("&{}", f.display_name()),
+                _ => format!("0x{ptr:X}"),
+            }
+        };
+        if adj != 0 {
+            value.push_str(&format!(", this + {}", adj as i32));
+        }
+        return value;
+    }
+    let Some(offset) = mem.read32(addr) else {
+        return "<unreadable>".into();
+    };
+    if offset == u32::MAX {
+        return "NULL".into();
+    }
+    let member = match class_desc {
+        Some(TypeDesc::Struct { members, .. }) => members.iter().find(|m| {
+            m.offset == Some(offset) && info.resolve_type(m.ty) == info.resolve_type(target)
+        }),
+        _ => None,
+    };
+    match member {
+        Some(m) => format!("&{class_name}::{}", m.name),
+        None => format!("offset {offset}"),
+    }
 }
 
 fn read_signed(mem: &mut GuestMem, addr: u32, size: u32) -> Option<i64> {
@@ -628,7 +721,7 @@ pub fn typed_children(
     match desc {
         TypeDesc::Struct { members, .. } => {
             for m in members {
-                let r = render(info, mem, m.ty, addr.wrapping_add(m.offset), frame);
+                let r = render_member(info, mem, m, addr, frame);
                 push(&mut out, store, m.name.clone(), r);
             }
         }
@@ -688,6 +781,24 @@ pub fn locals(
             frame_index,
         ));
     }
+    // A template instance's arguments, as read-only constants.
+    for p in &function.template_params {
+        let (value, ty) = if p.is_type {
+            (info.type_name(p.ty), "typename".to_string())
+        } else {
+            (
+                p.value.map_or_else(|| "?".into(), |v| v.to_string()),
+                info.type_name(p.ty),
+            )
+        };
+        out.push(json!({
+            "name": p.name,
+            "value": value,
+            "type": ty,
+            "variablesReference": 0,
+            "presentationHint": {"kind": "property", "attributes": ["constant", "readOnly"]},
+        }));
+    }
     out
 }
 
@@ -728,7 +839,8 @@ pub fn globals(
         ) {
             continue;
         }
-        if sym.name.starts_with("__") {
+        let demangled = crate::debuginfo::demangle(&sym.name);
+        if sym.name.starts_with("__") && demangled.is_none() {
             continue;
         }
         let Some(addr) = info.runtime(sym.at) else {
@@ -736,7 +848,7 @@ pub fn globals(
         };
         let value = mem.read32(addr).map_or("<unreadable>".into(), hex32);
         out.push(json!({
-            "name": sym.name,
+            "name": demangled.unwrap_or_else(|| sym.name.clone()),
             "value": value,
             "type": "long",
             "evaluateName": sym.name,

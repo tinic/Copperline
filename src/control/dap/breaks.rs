@@ -520,7 +520,7 @@ impl BreakTable {
             bp.installed.clear();
             if let Some(message) = &bp.message {
                 // A condition that never parsed stays unverified.
-                if !message.starts_with("unresolved") {
+                if !message.starts_with("unresolved") && !message.starts_with(MATCHES_PREFIX) {
                     self.points.insert(id, bp);
                     continue;
                 }
@@ -567,10 +567,30 @@ impl BreakTable {
                     self.install_pc(bridge, bp, addr);
                 }
             }
-            Kind::Function { name } => match info.lookup(name) {
-                Some(addr) => self.install_pc(bridge, bp, addr),
-                None => bp.message = Some(format!("unresolved: no symbol {name}")),
-            },
+            Kind::Function { name } => {
+                let name = name.clone();
+                let found = info.lookup_all(&name);
+                if found.is_empty() {
+                    bp.message = Some(format!("unresolved: no symbol {name}"));
+                    return;
+                }
+                // Overloads share a qualified name and all get the
+                // breakpoint; a name several functions answer to (an
+                // unqualified name in two scopes, a template without its
+                // arguments) gets it on every one, and says which.
+                for m in &found {
+                    self.install_pc(bridge, bp, m.addr);
+                }
+                let first = &found[0].name;
+                if bp.message.is_none() && found.iter().any(|m| &m.name != first) {
+                    let names: Vec<&str> = found.iter().map(|m| m.display.as_str()).collect();
+                    bp.message = Some(format!(
+                        "{MATCHES_PREFIX} {} functions: {}",
+                        found.len(),
+                        names.join(", ")
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -591,6 +611,10 @@ impl BreakTable {
         }
     }
 }
+
+/// How a function breakpoint's message lists the functions an
+/// ambiguous name matched; resolved again on every rebind.
+const MATCHES_PREFIX: &str = "matches";
 
 /// Word watches per data breakpoint, like the GDB stub's cap.
 const DATA_WORD_CAP: usize = 8;

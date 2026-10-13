@@ -1613,12 +1613,11 @@ impl Session {
                         }
                         _ => None,
                     });
-                match member {
-                    Some(m) => (
-                        addr.wrapping_add(m.offset),
-                        info.type_size(m.ty).unwrap_or(4),
-                    ),
-                    None => return none("not a member"),
+                match member.and_then(|m| Some((m.offset?, m.ty))) {
+                    Some((offset, ty)) => {
+                        (addr.wrapping_add(offset), info.type_size(ty).unwrap_or(4))
+                    }
+                    None => return none("not a member at a fixed offset"),
                 }
             }
             _ => match self.variable_place(name) {
@@ -1791,14 +1790,15 @@ impl Session {
     fn frame_name(&self, pc: u32, lookup: u32, rom_symbols: &SymbolSnapshot) -> String {
         if let Some(info) = &self.info {
             if let Some(f) = info.function_at(lookup) {
-                return f.name.trim_start_matches('_').to_string();
+                return f.display_name().trim_start_matches('_').to_string();
             }
             if let Some((sym, off)) = info.symbol_at(lookup) {
                 let off = off.wrapping_add(pc.wrapping_sub(lookup));
+                let name = sym.display_name();
                 return if off == 0 {
-                    sym.name.clone()
+                    name
                 } else {
-                    format!("{}+{off}", sym.name)
+                    format!("{name}+{off}")
                 };
             }
         }
@@ -1961,8 +1961,9 @@ impl Session {
                                 _ => None,
                             })
                             .ok_or("not a settable member")?;
+                        let offset = member.offset.ok_or("member has no fixed offset")?;
                         (
-                            addr.wrapping_add(member.offset),
+                            addr.wrapping_add(offset),
                             info.type_size(member.ty).unwrap_or(4),
                         )
                     } else {
@@ -2236,7 +2237,7 @@ impl Session {
             if let Some(info) = &self.info {
                 if let Some((sym, off)) = info.symbol_at(addr) {
                     if off == 0 {
-                        entry["symbol"] = Value::from(sym.name.clone());
+                        entry["symbol"] = Value::from(sym.display_name());
                         program_symbol = true;
                     }
                 }
