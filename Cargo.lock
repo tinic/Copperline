@@ -791,6 +791,7 @@ dependencies = [
  "color_quant 2.0.0",
  "coppersynth",
  "cpal",
+ "cpp_demangle",
  "delharc",
  "egui",
  "egui-wgpu",
@@ -959,6 +960,15 @@ dependencies = [
  "web-sys",
  "windows",
  "windows-core",
+]
+
+[[package]]
+name = "cpp_demangle"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0667304c32ea56cb4cd6d2d7c0cfe9a2f8041229db8c033af7f8d69492429def"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]

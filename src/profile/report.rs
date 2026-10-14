@@ -751,11 +751,14 @@ mod tests {
         }];
         debug.functions = vec![Function {
             name: "parent".into(),
+            linkage_name: None,
+            demangled: None,
             at: HunkAddr::new(0, 0),
             size: 0x100,
             frame_base: crate::debuginfo::Location::Unsupported,
             params: Vec::new(),
             locals: Vec::new(),
+            template_params: Vec::new(),
             file: Some(0),
             line: Some(1),
         }];
@@ -859,11 +862,14 @@ mod tests {
         }];
         debug.functions = vec![Function {
             name: "patched_entry".into(),
+            linkage_name: None,
+            demangled: None,
             at: HunkAddr::new(0, 0),
             size: 0x100,
             frame_base: crate::debuginfo::Location::Unsupported,
             params: Vec::new(),
             locals: Vec::new(),
+            template_params: Vec::new(),
             file: None,
             line: None,
         }];

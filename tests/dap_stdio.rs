@@ -188,6 +188,201 @@ fn dap_binds_packed_hunk_dwarf_after_loadseg() {
 }
 
 #[test]
+#[ignore = "boots bundled AROS and launches the emulator plus DAP adapter"]
+fn dap_debugs_cpp_names_overloads_references_and_bases() {
+    struct Adapter(std::process::Child);
+    impl Drop for Adapter {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("guest/dap-test/cpp");
+    let mut child = Adapter(
+        Command::new(env!("CARGO_BIN_EXE_copperline-ctl"))
+            .arg("--dap")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("starting adapter"),
+    );
+    let stdin = child.0.stdin.take().unwrap();
+    let stdout = BufReader::new(child.0.stdout.take().unwrap());
+    let (tx, rx) = channel();
+    std::thread::spawn(move || read_messages(stdout, tx));
+    let mut c = Client {
+        stdin,
+        rx,
+        seq: 0,
+        backlog: std::cell::RefCell::new(Vec::new()),
+    };
+    c.call("initialize", json!({"clientID": "test"}));
+    c.call(
+        "launch",
+        json!({
+            "program": dir.join("program"),
+            "copperline": env!("CARGO_BIN_EXE_copperline"),
+            "factory": true,
+            "headless": true,
+            "model": "A500",
+            "cpu": "68020",
+            "stack": 32768,
+            "stopOnEntry": true,
+            "entryPoint": "entry",
+            "timeoutMs": 120000,
+        }),
+    );
+    c.event("initialized");
+    let names = ["geo::Scaler::scale", "adjust", "repeat", "inspect"];
+    let bps = c.call(
+        "setFunctionBreakpoints",
+        json!({"breakpoints": names.iter().map(|n| json!({"name": n})).collect::<Vec<_>>()}),
+    );
+    let ids: Vec<i64> = bps["breakpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), names.len(), "{bps}");
+    c.call("configurationDone", json!({}));
+    c.event("module");
+    for (&id, name) in ids.iter().zip(names) {
+        let bound = c.wait(
+            name,
+            |m| {
+                m["type"] == "event"
+                    && m["event"] == "breakpoint"
+                    && m["body"]["breakpoint"]["id"] == id
+            },
+            Duration::from_secs(30),
+        );
+        let bp = &bound["body"]["breakpoint"];
+        assert_eq!(bp["verified"], true, "{name}: {bound}");
+        let message = bp["message"].as_str().unwrap_or("");
+        if name == "repeat" {
+            // Two instances, two names: bound on both and listed.
+            assert!(
+                message.starts_with("matches 2 functions: geo::repeat<int, 2>(int), ")
+                    && message.ends_with("geo::repeat<short, 3>(short)"),
+                "{bound}"
+            );
+        } else {
+            // Overloads of one name, and a unique unqualified name.
+            assert_eq!(message, "", "{name}: {bound}");
+        }
+    }
+    let stop = c.stopped();
+    assert_eq!(stop["reason"], "entry", "{stop}");
+
+    // Stop at the next function breakpoint: the innermost frame's name
+    // and its Locals by name.
+    let next = |c: &mut Client, id: i64, function: &str| -> Vec<Value> {
+        c.call("continue", json!({"threadId": 1}));
+        let stop = c.stopped();
+        assert_eq!(stop["reason"], "breakpoint", "{stop}");
+        assert_eq!(stop["hitBreakpointIds"], json!([id]), "{stop}");
+        let frames = c.call("stackTrace", json!({"threadId": 1}));
+        let top = &frames["stackFrames"][0];
+        assert_eq!(top["name"], function, "{frames}");
+        assert!(top["source"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("main.cpp"));
+        let scopes = c.call("scopes", json!({"frameId": top["id"]}));
+        let locals = scopes["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Locals")
+            .unwrap()
+            .clone();
+        c.call(
+            "variables",
+            json!({"variablesReference": locals["variablesReference"]}),
+        )["variables"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let find = |vars: &[Value], name: &str| -> Value {
+        vars.iter()
+            .find(|v| v["name"] == name)
+            .unwrap_or_else(|| panic!("{name} in {vars:?}"))
+            .clone()
+    };
+
+    let vars = next(&mut c, ids[0], "geo::Scaler::scale(int) const");
+    assert_eq!(find(&vars, "value")["value"], "5");
+    assert_eq!(
+        find(&vars, "this")["type"],
+        "const struct geo::Scaler * const"
+    );
+    next(&mut c, ids[0], "geo::Scaler::scale(int, int) const");
+    let vars = next(&mut c, ids[2], "geo::repeat<int, 2>(int)");
+    assert_eq!(find(&vars, "T")["value"], "int");
+    assert_eq!(find(&vars, "N")["value"], "2");
+    let vars = next(&mut c, ids[2], "geo::repeat<short, 3>(short)");
+    assert_eq!(find(&vars, "N")["value"], "3");
+    let vars = next(&mut c, ids[1], "(anonymous namespace)::adjust");
+    assert_eq!(find(&vars, "total")["type"], "int &");
+    let delta = find(&vars, "delta");
+    assert_eq!(
+        (&delta["type"], &delta["value"]),
+        (&json!("int &&"), &json!("7"))
+    );
+    next(&mut c, ids[0], "geo::Scaler::scale(int) const");
+    let vars = next(&mut c, ids[3], "inspect");
+    let item = find(&vars, "item");
+    assert_eq!(item["type"], "struct Item &", "{item}");
+    let members = c.call(
+        "variables",
+        json!({"variablesReference": item["variablesReference"]}),
+    )["variables"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(find(&members, "weight")["value"], "4");
+    assert_eq!(find(&members, "Counted")["type"], "struct Counted");
+    assert_eq!(find(&members, "Shared")["value"], "<unsupported location>");
+    let named = c.call(
+        "variables",
+        json!({"variablesReference": find(&members, "Named")["variablesReference"]}),
+    )["variables"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(find(&named, "id")["value"], "1");
+
+    let frames = c.call("stackTrace", json!({"threadId": 1}));
+    let scopes = c.call("scopes", json!({"frameId": frames["stackFrames"][0]["id"]}));
+    let globals = scopes["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "Globals")
+        .unwrap()
+        .clone();
+    let globals = c.call(
+        "variables",
+        json!({"variablesReference": globals["variablesReference"]}),
+    )["variables"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(find(&globals, "axis")["value"], "&geo::Point::y");
+    assert_eq!(
+        find(&globals, "method")["value"],
+        "&geo::Scaler::scale(int) const"
+    );
+
+    c.call("disconnect", json!({"terminateDebuggee": true}));
+    drop(c);
+    assert!(child.0.wait().expect("adapter exits").success());
+}
+
+#[test]
 #[ignore = "boots local Kickstart 1.3"]
 fn dap_binds_source_breakpoints_on_kick13() {
     let assets = std::env::var_os("COPPERLINE_TEST_ASSETS")

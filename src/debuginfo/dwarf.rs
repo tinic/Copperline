@@ -7,10 +7,13 @@
 //! script's addresses. Both come out as the same [`Loaded`] tables, with
 //! addresses already turned into hunk + offset.
 //!
-//! Only the DWARF a C debugger needs at -O0 is read: line programs,
-//! subprograms with their parameters and locals, lexical blocks, global
-//! variables, the common type DIEs, and `.debug_frame` / `.eh_frame` for
-//! unwinding. Variable locations are the single-operation forms
+//! Only the DWARF a C or C++ debugger needs at -O0 is read: line
+//! programs, subprograms with their parameters, locals and template
+//! parameters, lexical blocks, global variables, the common type DIEs
+//! (C++ references, pointers to members and base classes included), and
+//! `.debug_frame` / `.eh_frame` for unwinding. Function, global and type
+//! names are qualified with the namespaces and classes their declaration
+//! is nested in. Variable locations are the single-operation forms
 //! (`DW_OP_addr`, `DW_OP_fbreg`, `DW_OP_bregN`, `DW_OP_regN`,
 //! `DW_OP_call_frame_cfa`); anything else is reported as unsupported
 //! rather than guessed.
@@ -18,7 +21,7 @@
 use super::hunk::DwarfBlock;
 use super::{
     Encoding, Function, HunkAddr, HunkMeta, InlineFunction, LineRow, LinkMap, LinkSegment,
-    Location, Member, Symbol, TypeDesc, TypeId, Variable,
+    Location, Member, Symbol, TemplateParam, TypeDesc, TypeId, Variable,
 };
 use gimli::{
     AttributeValue, BigEndian, DebuggingInformationEntry, Dwarf, EndianSlice, Reader, Unit,
@@ -32,6 +35,11 @@ type Slice<'a> = EndianSlice<'a, BigEndian>;
 
 /// DIE nesting the tree walk follows before giving up on a subtree.
 const MAX_DIE_DEPTH: usize = 128;
+
+/// `DW_AT_specification` / `DW_AT_abstract_origin` links followed from
+/// a DIE to its declaration (a concrete constructor reaches its class
+/// through two).
+const MAX_ORIGIN_HOPS: usize = 8;
 
 /// The tables one DWARF source yields, with file and type ids local to
 /// this load (the caller remaps them).
@@ -354,6 +362,9 @@ type StaticMap<'a> = dyn Fn(&str, u64) -> Option<HunkAddr> + 'a;
 /// What a DIE on the current path contributes to its descendants.
 enum Frame {
     Function(usize),
+    /// A subprogram without code (a method declaration): its parameters
+    /// belong to no function.
+    Declaration,
     Inline,
     Block(Option<(HunkAddr, u32)>),
     Struct(TypeId),
@@ -373,6 +384,9 @@ struct Ctx<'d, 'a> {
     /// Line programs already read, so units sharing one do not
     /// duplicate its rows.
     line_programs: std::collections::HashSet<usize>,
+    /// The current unit's named DIEs (by offset), qualified with their
+    /// enclosing namespaces and classes.
+    qualified: HashMap<usize, String>,
 }
 
 impl<'d, 'a> Ctx<'d, 'a> {
@@ -413,6 +427,116 @@ impl<'d, 'a> Ctx<'d, 'a> {
                     }
                 }
             }
+        }
+        None
+    }
+
+    /// The DIE `entry` completes or instantiates, one hop.
+    fn origin_of(entry: &Die<'a>) -> Option<UnitOffset<usize>> {
+        [gimli::DW_AT_specification, gimli::DW_AT_abstract_origin]
+            .into_iter()
+            .find_map(|at| match entry.attr_value(at) {
+                Some(AttributeValue::UnitRef(off)) => Some(off),
+                _ => None,
+            })
+    }
+
+    /// The qualified name of `entry` (`geo::Scaler::scale`), taken from
+    /// the declaration at the end of its specification / abstract
+    /// origin chain, so an out-of-line definition at unit level gets
+    /// its class's scope.
+    fn qualified_name(&self, unit: &Unit<Slice<'a>>, entry: &Die<'a>) -> Option<String> {
+        let mut offset = entry.offset();
+        let mut next = Self::origin_of(entry);
+        for _ in 0..MAX_ORIGIN_HOPS {
+            let Some(off) = next else {
+                break;
+            };
+            let Ok(origin) = unit.entry(off) else {
+                break;
+            };
+            offset = off;
+            next = Self::origin_of(&origin);
+        }
+        self.qualified
+            .get(&offset.0)
+            .cloned()
+            .or_else(|| self.name_via_origin(unit, entry))
+    }
+
+    /// `DW_AT_linkage_name` (or the pre-DWARF 4 `DW_AT_MIPS_linkage_name`)
+    /// of `entry` or of the declaration it completes.
+    fn linkage_name(&self, unit: &Unit<Slice<'a>>, entry: &Die<'a>) -> Option<String> {
+        let mut die = entry.clone();
+        for _ in 0..=MAX_ORIGIN_HOPS {
+            for at in [gimli::DW_AT_linkage_name, gimli::DW_AT_MIPS_linkage_name] {
+                if let Some(name) = die.attr_value(at).and_then(|v| self.string(unit, v)) {
+                    return Some(name);
+                }
+            }
+            die = unit.entry(Self::origin_of(&die)?).ok()?;
+        }
+        None
+    }
+
+    /// The qualified name of the type DIE `entry` refers to.
+    fn type_ref_name(&self, entry: &Die<'a>) -> Option<String> {
+        match entry.attr_value(gimli::DW_AT_type)? {
+            AttributeValue::UnitRef(off) => self.qualified.get(&off.0).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Record the qualified name of every named DIE under `node`, whose
+    /// enclosing scopes are `prefix` (`""` at unit level).
+    fn collect_names(
+        &mut self,
+        unit: &Unit<Slice<'a>>,
+        node: gimli::EntriesTreeNode<'_, '_, Slice<'a>>,
+        prefix: &str,
+        depth: usize,
+    ) -> Result<(), String> {
+        if depth >= MAX_DIE_DEPTH {
+            return Ok(());
+        }
+        let entry = node.entry();
+        let name = self.name(unit, entry);
+        if let Some(name) = &name {
+            self.qualified
+                .insert(entry.offset().0, qualify(prefix, name));
+        }
+        let anonymous = match entry.tag() {
+            gimli::DW_TAG_namespace => Some("(anonymous namespace)"),
+            gimli::DW_TAG_structure_type => Some("(anonymous struct)"),
+            gimli::DW_TAG_class_type => Some("(anonymous class)"),
+            gimli::DW_TAG_union_type => Some("(anonymous union)"),
+            _ => None,
+        };
+        let inner = match anonymous {
+            Some(anonymous) => qualify(prefix, name.as_deref().unwrap_or(anonymous)),
+            None => prefix.to_string(),
+        };
+        let mut children = node.children();
+        while let Some(child) = children.next().map_err(|e| e.to_string())? {
+            self.collect_names(unit, child, &inner, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    /// `DW_AT_type` of `entry` or, when it has none (a definition
+    /// completing an `extern` declaration, a concrete instance of an
+    /// abstract one), of the DIE it completes.
+    fn type_ref_via_origin(&mut self, unit: &Unit<Slice<'a>>, entry: &Die<'a>) -> Option<TypeId> {
+        if let Some(ty) = self.type_ref(entry) {
+            return Some(ty);
+        }
+        let mut next = Self::origin_of(entry);
+        for _ in 0..MAX_ORIGIN_HOPS {
+            let origin = unit.entry(next?).ok()?;
+            if let Some(ty) = self.type_ref(&origin) {
+                return Some(ty);
+            }
+            next = Self::origin_of(&origin);
         }
         None
     }
@@ -506,15 +630,27 @@ impl<'d, 'a> Ctx<'d, 'a> {
         }
     }
 
+    /// A parameter, local (`scope` is its block) or, when `global`, a
+    /// global with its qualified name.
     fn variable(
         &mut self,
         unit: &Unit<Slice<'a>>,
         entry: &Die<'a>,
         scope: Option<(HunkAddr, u32)>,
+        global: bool,
     ) -> Option<Variable> {
-        let name = self.name_via_origin(unit, entry)?;
-        let ty = self.type_ref(entry);
-        let location = self.location(unit, entry, gimli::DW_AT_location, &name);
+        let name = if global {
+            self.qualified_name(unit, entry)?
+        } else {
+            self.name_via_origin(unit, entry)?
+        };
+        let ty = self.type_ref_via_origin(unit, entry);
+        // A global's hunk symbol is its linkage name for C++.
+        let symbol = global
+            .then(|| self.linkage_name(unit, entry))
+            .flatten()
+            .unwrap_or_else(|| name.clone());
+        let location = self.location(unit, entry, gimli::DW_AT_location, &symbol);
         Some(Variable {
             name,
             ty,
@@ -585,6 +721,10 @@ impl<'d, 'a> Ctx<'d, 'a> {
     fn read_dies(&mut self, unit: &Unit<Slice<'a>>) -> Result<(), String> {
         let mut tree = unit.entries_tree(None).map_err(|e| e.to_string())?;
         let root = tree.root().map_err(|e| e.to_string())?;
+        self.qualified.clear();
+        self.collect_names(unit, root, "", 0)?;
+        let mut tree = unit.entries_tree(None).map_err(|e| e.to_string())?;
+        let root = tree.root().map_err(|e| e.to_string())?;
         let mut stack: Vec<Frame> = Vec::new();
         self.walk(unit, root, &mut stack)
     }
@@ -613,10 +753,17 @@ impl<'d, 'a> Ctx<'d, 'a> {
     }
 
     fn visit(&mut self, unit: &Unit<Slice<'a>>, entry: &Die<'a>, stack: &[Frame]) -> Frame {
-        let function = stack.iter().rev().find_map(|f| match f {
-            Frame::Function(i) => Some(*i),
-            _ => None,
-        });
+        // A class or a method declaration nested in a function (a local
+        // class, a lambda) ends the search: its contents are not locals.
+        let function = stack
+            .iter()
+            .rev()
+            .find_map(|f| match f {
+                Frame::Function(i) => Some(Some(*i)),
+                Frame::Declaration | Frame::Struct(_) => Some(None),
+                _ => None,
+            })
+            .flatten();
         let scope = stack.iter().rev().find_map(|f| match f {
             Frame::Block(range) => Some(*range),
             Frame::Function(_) => Some(None),
@@ -625,22 +772,27 @@ impl<'d, 'a> Ctx<'d, 'a> {
         match entry.tag() {
             gimli::DW_TAG_subprogram => {
                 let Some((at, size)) = self.pc_range(entry) else {
-                    return Frame::Other;
+                    return Frame::Declaration;
                 };
                 let name = self
-                    .name_via_origin(unit, entry)
+                    .qualified_name(unit, entry)
                     .unwrap_or_else(|| format!("fn_{:x}", entry.offset().0));
+                let linkage_name = self.linkage_name(unit, entry);
+                let demangled = linkage_name.as_deref().and_then(super::demangle);
                 let frame_base = self.location(unit, entry, gimli::DW_AT_frame_base, &name);
                 let file = Self::udata(entry, gimli::DW_AT_decl_file);
                 let line = Self::udata(entry, gimli::DW_AT_decl_line);
                 let file = file.and_then(|index| self.decl_file(unit, index));
                 self.out.functions.push(Function {
                     name,
+                    linkage_name,
+                    demangled,
                     at,
                     size,
                     frame_base,
                     params: Vec::new(),
                     locals: Vec::new(),
+                    template_params: Vec::new(),
                     file,
                     line: line.and_then(|l| u32::try_from(l).ok()),
                 });
@@ -652,7 +804,7 @@ impl<'d, 'a> Ctx<'d, 'a> {
                     return Frame::Other;
                 }
                 let name = self
-                    .name_via_origin(unit, entry)
+                    .qualified_name(unit, entry)
                     .unwrap_or_else(|| format!("inline_{:x}", entry.offset().0));
                 let file = Self::udata(entry, gimli::DW_AT_call_file)
                     .or_else(|| Self::udata(entry, gimli::DW_AT_decl_file))
@@ -675,7 +827,7 @@ impl<'d, 'a> Ctx<'d, 'a> {
             }
             gimli::DW_TAG_lexical_block => Frame::Block(self.pc_range(entry)),
             gimli::DW_TAG_formal_parameter => {
-                if let (Some(f), Some(v)) = (function, self.variable(unit, entry, None)) {
+                if let (Some(f), Some(v)) = (function, self.variable(unit, entry, None, false)) {
                     self.out.functions[f].params.push(v);
                 }
                 Frame::Other
@@ -683,7 +835,7 @@ impl<'d, 'a> Ctx<'d, 'a> {
             gimli::DW_TAG_variable => {
                 match function {
                     Some(f) => {
-                        if let Some(v) = self.variable(unit, entry, scope.flatten()) {
+                        if let Some(v) = self.variable(unit, entry, scope.flatten(), false) {
                             self.out.functions[f].locals.push(v);
                         }
                     }
@@ -691,7 +843,7 @@ impl<'d, 'a> Ctx<'d, 'a> {
                         // A declaration without a location is not a
                         // variable we can show; a definition elsewhere
                         // in the unit carries the address.
-                        if let Some(v) = self.variable(unit, entry, None) {
+                        if let Some(v) = self.variable(unit, entry, None, true) {
                             if v.location != Location::Unsupported {
                                 self.out.globals.push(v);
                             }
@@ -723,11 +875,41 @@ impl<'d, 'a> Ctx<'d, 'a> {
                 };
                 Frame::Other
             }
-            gimli::DW_TAG_pointer_type | gimli::DW_TAG_reference_type => {
+            gimli::DW_TAG_pointer_type => {
                 let id = self.type_id(entry.offset());
                 let target = self.type_ref(entry);
                 let size = byte_size(entry, 4);
                 self.out.types[id] = TypeDesc::Pointer { target, size };
+                Frame::Other
+            }
+            gimli::DW_TAG_reference_type | gimli::DW_TAG_rvalue_reference_type => {
+                let id = self.type_id(entry.offset());
+                let target = self.type_ref(entry);
+                let size = byte_size(entry, 4);
+                let rvalue = entry.tag() == gimli::DW_TAG_rvalue_reference_type;
+                self.out.types[id] = TypeDesc::Reference {
+                    target,
+                    size,
+                    rvalue,
+                };
+                Frame::Other
+            }
+            gimli::DW_TAG_ptr_to_member_type => {
+                let id = self.type_id(entry.offset());
+                let target = self.type_ref(entry);
+                let class = match entry.attr_value(gimli::DW_AT_containing_type) {
+                    Some(AttributeValue::UnitRef(off)) => Some(self.type_id(off)),
+                    _ => None,
+                };
+                let size = entry
+                    .attr_value(gimli::DW_AT_byte_size)
+                    .and_then(|v| v.udata_value())
+                    .and_then(|v| u32::try_from(v).ok());
+                self.out.types[id] = TypeDesc::MemberPointer {
+                    class,
+                    target,
+                    size,
+                };
                 Frame::Other
             }
             gimli::DW_TAG_array_type => {
@@ -753,7 +935,7 @@ impl<'d, 'a> Ctx<'d, 'a> {
             }
             gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type => {
                 let id = self.type_id(entry.offset());
-                let name = self.name(unit, entry);
+                let name = self.qualified.get(&entry.offset().0).cloned();
                 let size = byte_size(entry, 0);
                 self.out.types[id] = TypeDesc::Struct {
                     name,
@@ -775,9 +957,42 @@ impl<'d, 'a> Ctx<'d, 'a> {
                 }
                 Frame::Other
             }
+            gimli::DW_TAG_inheritance => {
+                // A base class subobject, shown as a member named after
+                // the base; a virtual base's offset is an expression
+                // over the vtable, left unsupported.
+                if let Some(Frame::Struct(id)) = stack.last() {
+                    let id = *id;
+                    let name = self.type_ref_name(entry).unwrap_or_else(|| "<base>".into());
+                    let ty = self.type_ref(entry);
+                    let offset = self.member_offset(unit, entry);
+                    if let TypeDesc::Struct { members, .. } = &mut self.out.types[id] {
+                        members.push(Member { name, ty, offset });
+                    }
+                }
+                Frame::Other
+            }
+            gimli::DW_TAG_template_type_parameter | gimli::DW_TAG_template_value_parameter => {
+                // Only a function instance's own parameters: a class
+                // template's are not shown.
+                if let Some(Frame::Function(f)) = stack.last() {
+                    let f = *f;
+                    let is_type = entry.tag() == gimli::DW_TAG_template_type_parameter;
+                    let param = TemplateParam {
+                        name: self.name(unit, entry).unwrap_or_default(),
+                        ty: self.type_ref(entry),
+                        value: (!is_type)
+                            .then(|| Self::sdata(entry, gimli::DW_AT_const_value))
+                            .flatten(),
+                        is_type,
+                    };
+                    self.out.functions[f].template_params.push(param);
+                }
+                Frame::Other
+            }
             gimli::DW_TAG_enumeration_type => {
                 let id = self.type_id(entry.offset());
-                let name = self.name(unit, entry);
+                let name = self.qualified.get(&entry.offset().0).cloned();
                 let size = byte_size(entry, 4);
                 self.out.types[id] = TypeDesc::Enum {
                     name,
@@ -799,7 +1014,11 @@ impl<'d, 'a> Ctx<'d, 'a> {
             }
             gimli::DW_TAG_typedef => {
                 let id = self.type_id(entry.offset());
-                let name = self.name(unit, entry).unwrap_or_else(|| "?".into());
+                let name = self
+                    .qualified
+                    .get(&entry.offset().0)
+                    .cloned()
+                    .unwrap_or_else(|| "?".into());
                 let target = self.type_ref(entry);
                 self.out.types[id] = TypeDesc::Typedef { name, target };
                 Frame::Other
@@ -829,23 +1048,22 @@ impl<'d, 'a> Ctx<'d, 'a> {
         }
     }
 
-    /// `DW_AT_data_member_location` as a byte offset.
-    fn member_offset(&self, unit: &Unit<Slice<'a>>, entry: &Die<'a>) -> u32 {
+    /// `DW_AT_data_member_location` as a byte offset: a constant or a
+    /// lone `DW_OP_plus_uconst`. Any other expression (a virtual base)
+    /// is `None`; no location at all is offset 0 (a union member).
+    fn member_offset(&self, unit: &Unit<Slice<'a>>, entry: &Die<'a>) -> Option<u32> {
         match entry.attr_value(gimli::DW_AT_data_member_location) {
             Some(AttributeValue::Exprloc(expr)) => {
                 let mut reader = expr.0;
                 match gimli::Operation::parse(&mut reader, unit.encoding()) {
-                    Ok(gimli::Operation::PlusConstant { value }) => {
-                        u32::try_from(value).unwrap_or(0)
+                    Ok(gimli::Operation::PlusConstant { value }) if reader.is_empty() => {
+                        u32::try_from(value).ok()
                     }
-                    _ => 0,
+                    _ => None,
                 }
             }
-            Some(other) => other
-                .udata_value()
-                .and_then(|v| u32::try_from(v).ok())
-                .unwrap_or(0),
-            None => 0,
+            Some(other) => other.udata_value().and_then(|v| u32::try_from(v).ok()),
+            None => Some(0),
         }
     }
 
@@ -885,6 +1103,7 @@ fn read_dwarf(
         type_ids: HashMap::new(),
         unit_index: 0,
         line_programs: std::collections::HashSet::new(),
+        qualified: HashMap::new(),
     };
     let mut offset = first_unit;
     let end = gimli::Section::reader(&dwarf.debug_info).len();
@@ -918,6 +1137,15 @@ fn byte_size(entry: &Die<'_>, default: u32) -> u32 {
         .and_then(|v| v.udata_value())
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(default)
+}
+
+/// `name` inside the scope `prefix` (`""` at unit level).
+fn qualify(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}::{name}")
+    }
 }
 
 fn intern(files: &mut Vec<String>, path: &str) -> u32 {

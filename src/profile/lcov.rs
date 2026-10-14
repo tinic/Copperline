@@ -594,11 +594,14 @@ mod tests {
     fn function(name: &str, offset: u32, size: u32, file: u32, line: u32) -> Function {
         Function {
             name: name.into(),
+            linkage_name: None,
+            demangled: None,
             at: HunkAddr::new(0, offset),
             size,
             frame_base: Location::Unsupported,
             params: Vec::new(),
             locals: Vec::new(),
+            template_params: Vec::new(),
             file: Some(file),
             line: Some(line),
         }
@@ -726,21 +729,9 @@ mod tests {
         // symbols and symbols without a line are skipped.
         debug.functions.clear();
         debug.symbols = vec![
-            Symbol {
-                name: "start".into(),
-                at: HunkAddr::new(0, 0),
-                size: None,
-            },
-            Symbol {
-                name: "twice".into(),
-                at: HunkAddr::new(0, 0x20),
-                size: None,
-            },
-            Symbol {
-                name: "value".into(),
-                at: HunkAddr::new(1, 0),
-                size: None,
-            },
+            Symbol::new("start", HunkAddr::new(0, 0), None),
+            Symbol::new("twice", HunkAddr::new(0, 0x20), None),
+            Symbol::new("value", HunkAddr::new(1, 0), None),
         ];
         let (text, summary) = render(&debug, "t", &[(0x1000, 1), (0x1020, 2)], 0, 3, &[], &[]);
         assert!(text.contains("FN:10,start\nFNDA:1,start\n"), "{text}");

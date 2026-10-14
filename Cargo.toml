@@ -165,9 +165,9 @@ gdb = ["control"]
 # (src/debuginfo/: hunk symbol tables, vasm LINE debug hunks, DWARF from
 # a bebbo debug hunk or an ELF sibling). A control-protocol client like
 # the MCP mode, so it needs serde_json like `control`, plus gimli and
-# object for DWARF and ELF. Off in player builds with the rest of the
-# debugger surface.
-dap = ["control", "dep:gimli", "dep:object"]
+# object for DWARF and ELF, and cpp_demangle for C++ names. Off in player
+# builds with the rest of the debugger surface.
+dap = ["control", "dep:gimli", "dep:object", "dep:cpp_demangle"]
 # Real floppy drives through FluxBridge (src/fluxbridge/): the Greaseweazle
 # driver enabled on the dependency below stands in for a disk image on any bay.
 # FluxBridge is a pure-Rust library, so there is nothing to install and no C++
@@ -207,6 +207,10 @@ sha2 = { version = "0.11", default-features = false }
 # unwinding. Both pure Rust (MIT OR Apache-2.0).
 gimli = { version = "0.34", default-features = false, features = ["read", "std"], optional = true }
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"], optional = true }
+# Itanium C++ demangler for the DAP adapter: g++ linkage names and the
+# mangled hunk symbols shown in stack frames and disassembly. Pure Rust
+# (MIT OR Apache-2.0), from the gimli-rs project like gimli itself.
+cpp_demangle = { version = "0.5", default-features = false, features = ["std"], optional = true }
 # Formatting-preserving TOML writer, so the generated config can carry
 # per-setting comments (copperline-import-uae only).
 toml_edit = { version = "0.25", optional = true }

@@ -9,7 +9,7 @@
 use super::eval;
 use crate::control::bridge::{Bridge, Reply};
 use crate::debugger::{BreakCond, CondOp, CondOperand};
-use crate::debuginfo::DebugInfo;
+use crate::debuginfo::{DebugInfo, NameMatch};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -520,7 +520,7 @@ impl BreakTable {
             bp.installed.clear();
             if let Some(message) = &bp.message {
                 // A condition that never parsed stays unverified.
-                if !message.starts_with("unresolved") {
+                if !message.starts_with("unresolved") && !message.starts_with(MATCHES_PREFIX) {
                     self.points.insert(id, bp);
                     continue;
                 }
@@ -567,10 +567,21 @@ impl BreakTable {
                     self.install_pc(bridge, bp, addr);
                 }
             }
-            Kind::Function { name } => match info.lookup(name) {
-                Some(addr) => self.install_pc(bridge, bp, addr),
-                None => bp.message = Some(format!("unresolved: no symbol {name}")),
-            },
+            Kind::Function { name } => {
+                let name = name.clone();
+                let found = info.lookup_all(&name);
+                if found.is_empty() {
+                    bp.message = Some(format!("unresolved: no symbol {name}"));
+                    return;
+                }
+                let (bound, message) = function_binding(&found);
+                for m in bound {
+                    self.install_pc(bridge, bp, m.addr);
+                }
+                if bp.message.is_none() {
+                    bp.message = message;
+                }
+            }
             _ => {}
         }
     }
@@ -590,6 +601,47 @@ impl BreakTable {
             let _ = bridge.call("break.remove", json!({"id": id}));
         }
     }
+}
+
+/// How a function breakpoint's message lists the functions an
+/// ambiguous name matched; resolved again on every rebind.
+const MATCHES_PREFIX: &str = "matches";
+
+/// Machine breakpoints one function breakpoint installs. A qualified
+/// name's overloads (a constructor's complete and base-object copies,
+/// a set of operator overloads) fit; a short name such as `get` that
+/// half the classes define does not flood the breakpoint table, and
+/// the message counts what was left out.
+const FUNCTION_MATCH_CAP: usize = 16;
+
+/// The matches of a function breakpoint's name to bind, and the message
+/// that says what it matched. Overloads share a qualified name and all
+/// get the breakpoint silently; a name several functions answer to (an
+/// unqualified name in two scopes, a template without its arguments)
+/// gets it on each and lists them. Past [`FUNCTION_MATCH_CAP`] only the
+/// first are bound, and the message counts the rest.
+fn function_binding(found: &[NameMatch]) -> (&[NameMatch], Option<String>) {
+    let bound = &found[..found.len().min(FUNCTION_MATCH_CAP)];
+    let ambiguous = found.iter().any(|m| m.name != found[0].name);
+    let left_out = found.len() - bound.len();
+    // The message starts with MATCHES_PREFIX either way, so a rebind
+    // resolves the name again.
+    let mut message = match (ambiguous, left_out) {
+        (false, 0) => return (bound, None),
+        (false, _) => format!("{MATCHES_PREFIX} {} functions", found.len()),
+        (true, _) => {
+            let names: Vec<&str> = bound.iter().map(|m| m.display.as_str()).collect();
+            format!(
+                "{MATCHES_PREFIX} {} functions: {}",
+                found.len(),
+                names.join(", ")
+            )
+        }
+    };
+    if left_out > 0 {
+        message.push_str(&format!("; {left_out} more not bound"));
+    }
+    (bound, Some(message))
 }
 
 /// Word watches per data breakpoint, like the GDB stub's cap.
@@ -666,6 +718,60 @@ fn parse_conditions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn matches(names: &[&str]) -> Vec<NameMatch> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| NameMatch {
+                name: name.to_string(),
+                display: format!("{name}()"),
+                addr: 0x1000 + 0x10 * i as u32,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn function_breakpoints_bind_overloads_silently_and_cap_the_rest() {
+        let overloads = matches(&["geo::Scaler::scale", "geo::Scaler::scale"]);
+        let (bound, message) = function_binding(&overloads);
+        assert_eq!((bound.len(), message), (2, None));
+
+        let two = matches(&["a::get", "b::get"]);
+        let (bound, message) = function_binding(&two);
+        assert_eq!(bound.len(), 2);
+        assert_eq!(
+            message.as_deref(),
+            Some("matches 2 functions: a::get(), b::get()")
+        );
+
+        let names: Vec<String> = (0..FUNCTION_MATCH_CAP + 5)
+            .map(|i| format!("c{i}::get"))
+            .collect();
+        let many = matches(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let (bound, message) = function_binding(&many);
+        assert_eq!(bound.len(), FUNCTION_MATCH_CAP);
+        assert_eq!(bound, &many[..FUNCTION_MATCH_CAP]);
+        let listed: Vec<String> = (0..FUNCTION_MATCH_CAP)
+            .map(|i| format!("c{i}::get()"))
+            .collect();
+        assert_eq!(
+            message.unwrap(),
+            format!(
+                "matches 21 functions: {}; 5 more not bound",
+                listed.join(", ")
+            )
+        );
+
+        // Overloads past the cap only say how many were left out.
+        let same = matches(&["f"; FUNCTION_MATCH_CAP + 1]);
+        let (bound, message) = function_binding(&same);
+        assert_eq!(bound.len(), FUNCTION_MATCH_CAP);
+        assert_eq!(
+            message.as_deref(),
+            Some("matches 17 functions; 1 more not bound")
+        );
+    }
 
     #[test]
     fn hit_conditions_become_ignore_counts() {
